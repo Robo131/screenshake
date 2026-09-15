@@ -1,8 +1,8 @@
 PyAudioWPatch>=0.2.12.5
 pycaw>=20230407
 comtypes>=1.2.0
+psutil>=5.9.0
 numpy>=1.24.0
-pywin32>=306
+PySide6>=6.6.0
 keyboard>=0.13.5
-Pillow>=10.0.0
 pyinstaller>=6.0.0
