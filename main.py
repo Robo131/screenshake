@@ -49,6 +49,13 @@ except ImportError:
 import tkinter as tk
 
 try:
+    from PIL import Image, ImageTk
+except ImportError:
+    print("Missing dependency: Pillow. Run: pip install -r requirements.txt")
+    sys.exit(1)
+
+
+try:
     import win32gui
     import win32con
     import win32api
@@ -129,13 +136,31 @@ VOLUME_NOISE_FLOOR = 0.015
 # rolling average triggers a screen "jolt".
 KICK_SPIKE_RATIO = 1.8
 KICK_MIN_INTERVAL_SEC = 0.12   # don't re-trigger faster than this
-KICK_SHAKE_PIXELS = 14         # max pixel offset from a kick jolt
 KICK_DECAY_SEC = 0.16          # how fast the jolt settles back to center
 
-# Glow border look
-GLOW_COLOR = "#7fdfff"         # cyan-ish; change to taste, e.g. "#ff3366"
-GLOW_MIN_THICKNESS = 4
-GLOW_MAX_THICKNESS = 60
+# --- Shake (screen jolt) ---
+# BASS_SHAKE_PIXELS: a small constant jitter while bass is present, so the
+# screen feels "alive" during a rolling bassline, not just on hits.
+# KICK_SHAKE_PIXELS: a bigger jolt layered on top for individual kick hits.
+BASS_SHAKE_PIXELS = 6
+KICK_SHAKE_PIXELS = 32
+
+# --- Full-screen glow/swell look ---
+GLOW_COLOR = "#7fdfff"         # tint color; change to taste, e.g. "#ff3366"
+
+# Radial vignette: color washes in from the screen edges toward the
+# center as bass builds. Higher VIGNETTE_POWER keeps the center clearer
+# for longer (color stays concentrated near the edges); lower values let
+# it fill the whole screen sooner.
+VIGNETTE_POWER = 1.6
+VIGNETTE_MAX_ALPHA = 175       # 0-255, how opaque the glow gets at max bass
+VIGNETTE_LEVELS = 24           # precomputed intensity steps (smoothness vs. startup time/RAM)
+
+# Full-screen flash: a brief, near-uniform color wash across the ENTIRE
+# screen on kick hits, layered on top of the vignette - this is what
+# sells the "whole monitor swelling" feeling rather than just edges.
+FLASH_MAX_ALPHA = 130
+FLASH_LEVELS = 16
 
 # Audio capture
 CHUNK = 1024
@@ -348,7 +373,23 @@ class Overlay:
         self.root.update_idletasks()
         self._make_click_through()
 
-        self.kick_decay = 0.0
+        print("Warming up visuals (precomputing glow frames)...")
+        self.vignette_frames = self._build_gradient_frames(
+            levels=VIGNETTE_LEVELS, max_alpha=VIGNETTE_MAX_ALPHA,
+            power=VIGNETTE_POWER, radial=True,
+        )
+        self.flash_frames = self._build_gradient_frames(
+            levels=FLASH_LEVELS, max_alpha=FLASH_MAX_ALPHA,
+            power=1.0, radial=False,
+        )
+        print("Ready.")
+
+        self.vignette_image_id = self.canvas.create_image(
+            0, 0, anchor="nw", image=self.vignette_frames[0]
+        )
+        self.flash_image_id = self.canvas.create_image(
+            0, 0, anchor="nw", image=self.flash_frames[0]
+        )
 
     def _make_click_through(self):
         hwnd = win32gui.FindWindow(None, self.root.title() or None)
@@ -362,33 +403,66 @@ class Overlay:
         except Exception:
             pass  # if this fails, overlay still works, just won't be click-through
 
+    @staticmethod
+    def _hex_to_rgb(hex_color):
+        hex_color = hex_color.lstrip("#")
+        return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _build_gradient_frames(self, levels, max_alpha, power, radial):
+        """Precompute a list of full-screen RGBA PhotoImages, one per
+        intensity level (0 = invisible, `levels` = full max_alpha), so the
+        animation loop just swaps images instead of doing per-frame image
+        math. `radial=True` gives edge-to-center vignette; `radial=False`
+        gives a near-uniform full-screen wash (used for the kick flash)."""
+        w, h = self.screen_w, self.screen_h
+        color = self._hex_to_rgb(GLOW_COLOR)
+
+        if radial:
+            ys, xs = np.mgrid[0:h, 0:w]
+            cx, cy = w / 2.0, h / 2.0
+            dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+            max_dist = math.sqrt(cx ** 2 + cy ** 2)
+            norm = np.clip(dist / max_dist, 0.0, 1.0)
+            weight = norm ** power
+        else:
+            weight = np.ones((h, w), dtype=np.float64)
+
+        frames = []
+        for level in range(levels + 1):
+            intensity = level / levels
+            alpha = (weight * intensity * max_alpha).astype(np.uint8)
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[..., 0] = color[0]
+            rgba[..., 1] = color[1]
+            rgba[..., 2] = color[2]
+            rgba[..., 3] = alpha
+            img = Image.fromarray(rgba, mode="RGBA")
+            frames.append(ImageTk.PhotoImage(img))
+        return frames
+
     def frame(self):
-        self.canvas.delete("all")
-
-        bass = state.bass_level * state.suppress
+        bass = max(0.0, min(1.0, state.bass_level * state.suppress))
         state.kick_pulse *= 0.80  # decay each frame
-        kick = state.kick_pulse * state.suppress
+        kick = max(0.0, min(1.0, state.kick_pulse * state.suppress))
 
-        # --- swelling glow border ---
-        thickness = GLOW_MIN_THICKNESS + bass * (GLOW_MAX_THICKNESS - GLOW_MIN_THICKNESS)
-        if thickness > 1:
-            w, h = self.screen_w, self.screen_h
-            t = int(thickness)
-            # simple layered rectangles to fake a soft glow falloff
-            layers = 4
-            for i in range(layers, 0, -1):
-                frac = i / layers
-                lt = max(1, int(t * frac))
-                alpha_tag = f"glow{i}"
-                self.canvas.create_rectangle(
-                    0, 0, w, h, outline=GLOW_COLOR, width=lt
-                )
+        # --- swap in the right precomputed glow/flash frames ---
+        v_idx = int(round(bass * VIGNETTE_LEVELS))
+        v_idx = max(0, min(VIGNETTE_LEVELS, v_idx))
+        self.canvas.itemconfig(self.vignette_image_id, image=self.vignette_frames[v_idx])
 
-        # --- kick jolt (screen shake) ---
-        if kick > 0.02:
-            offset = kick * KICK_SHAKE_PIXELS
-            dx = int(random.uniform(-offset, offset))
-            dy = int(random.uniform(-offset, offset))
+        f_idx = int(round(kick * FLASH_LEVELS))
+        f_idx = max(0, min(FLASH_LEVELS, f_idx))
+        self.canvas.itemconfig(self.flash_image_id, image=self.flash_frames[f_idx])
+
+        # --- shake: a subtle constant jitter while bass is present, plus
+        # a bigger jolt layered on top for individual kick hits ---
+        bass_offset = bass * BASS_SHAKE_PIXELS
+        kick_offset = kick * KICK_SHAKE_PIXELS
+        total_offset = bass_offset + kick_offset
+
+        if total_offset > 0.5:
+            dx = int(random.uniform(-total_offset, total_offset))
+            dy = int(random.uniform(-total_offset, total_offset))
         else:
             dx = dy = 0
 
