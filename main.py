@@ -5,23 +5,32 @@ What it does:
   - Listens to your PC's system audio output (WASAPI loopback - everything
     playing through your speakers/headphones).
   - Runs an FFT to track bass energy and detect kick/transient hits.
-  - Drives a transparent, click-through, always-on-top fullscreen overlay
-    that glows/swells on bass and jolts on kicks.
+  - Drives a genuinely transparent, click-through, always-on-top fullscreen
+    overlay that glows/swells across the whole screen on bass and jolts on
+    kicks.
   - Every ~300ms it checks which application is currently the loudest audio
-    source on your system (via the Windows volume mixer API). If that app
-    is in EXCLUDED_PROCESSES (games like Roblox/Rust/Minecraft), the visual
-    effect is smoothly suppressed - so gunfire/footsteps in-game won't
-    trigger it, but Spotify/Chrome/Discord music will.
+    source on your system (via the Windows volume mixer API). Priority apps
+    (browsers, Voicemod, Spotify) always keep the effect on; only when none
+    of those are active does it check whether an excluded game
+    (Roblox/Rust/Minecraft) is dominant and suppress the effect if so.
+  - The effect strength also scales with actual playback volume, so quiet
+    audio barely moves the screen and loud audio hits hard.
+
+Why Qt (PySide6) instead of Tkinter:
+  Tkinter's "-transparentcolor" trick only makes pixels that are EXACTLY
+  the key color invisible - it can't do a soft alpha fade. A gradient glow
+  built that way renders as a solid near-black block (opaque, not
+  click-through) everywhere it isn't perfectly pure black. Qt's
+  WA_TranslucentBackground gives real per-pixel alpha compositing (backed
+  by the same Windows layered-window API real overlay apps use), so a soft
+  gradient actually fades to nothing and lets clicks/games through.
 
 Important honest limitation:
   Windows does not let a background app cleanly separate "this stream is
   music" from "this stream is game audio" at the waveform level. The
-  loopback capture always contains the full system mix. The exclusion logic
-  works by checking which app is *dominant* in the Windows volume mixer at
-  that moment, not by filtering the audio itself. This works well in
-  practice (if you're in Roblox, Roblox is almost always the loudest
-  session) but isn't a perfect guarantee - e.g. Discord/Spotify audio
-  playing *underneath* a loud game may still be temporarily suppressed.
+  loopback capture always contains the full system mix. The exclusion
+  logic works by checking which app is *dominant* in the Windows volume
+  mixer at that moment, not by filtering the audio itself.
 
 Run this on Windows only. See README.md for setup + build-to-exe steps.
 """
@@ -46,21 +55,12 @@ except ImportError:
     print("Missing dependency: pycaw. Run: pip install -r requirements.txt")
     sys.exit(1)
 
-import tkinter as tk
-
 try:
-    from PIL import Image, ImageTk
+    from PySide6.QtCore import Qt, QTimer, QRectF, QPointF
+    from PySide6.QtGui import QPainter, QRadialGradient, QColor, QGuiApplication
+    from PySide6.QtWidgets import QApplication, QWidget
 except ImportError:
-    print("Missing dependency: Pillow. Run: pip install -r requirements.txt")
-    sys.exit(1)
-
-
-try:
-    import win32gui
-    import win32con
-    import win32api
-except ImportError:
-    print("Missing dependency: pywin32. Run: pip install -r requirements.txt")
+    print("Missing dependency: PySide6. Run: pip install -r requirements.txt")
     sys.exit(1)
 
 try:
@@ -86,7 +86,6 @@ EXCLUDED_PROCESSES = {
 # Trusted/priority sources. If any of these are making meaningful noise,
 # the effect stays ON regardless of what else is playing (even if an
 # excluded game happens to be technically louder at that instant).
-# Add your browser(s) of choice, voice changer, and music apps here.
 PRIORITY_PROCESSES = {
     # Browsers
     "chrome.exe",
@@ -123,53 +122,47 @@ BASS_SENSITIVITY = 6.0
 # Scales the whole effect (swell + shake) by how loud the actual audio
 # currently is, so quiet background music barely moves the screen while
 # loud music hits hard. 1.0 = neutral, higher = more dramatic response to
-# volume changes, lower = flatter response (effect strength depends mostly
-# on bass content, not overall loudness).
+# volume changes, lower = flatter response.
 VOLUME_SENSITIVITY = 2.5
-# Exponent applied to the normalized volume before scaling (>1 makes quiet
-# audio contribute even less, <1 flattens the curve).
-VOLUME_CURVE = 1.4
-# Below this normalized volume (0.0-1.0), the effect is treated as silent.
-VOLUME_NOISE_FLOOR = 0.015
+VOLUME_CURVE = 1.4          # >1 makes quiet audio contribute even less
+VOLUME_NOISE_FLOOR = 0.015  # below this normalized volume, treat as silent
 
 # Kick/transient detection: a bass spike this many times above the recent
 # rolling average triggers a screen "jolt".
 KICK_SPIKE_RATIO = 1.8
 KICK_MIN_INTERVAL_SEC = 0.12   # don't re-trigger faster than this
-KICK_DECAY_SEC = 0.16          # how fast the jolt settles back to center
+KICK_DECAY_SEC = 0.16          # how fast a kick jolt settles back to zero
 
-# --- Shake (screen jolt) ---
-# BASS_SHAKE_PIXELS: a small constant jitter while bass is present, so the
-# screen feels "alive" during a rolling bassline, not just on hits.
-# KICK_SHAKE_PIXELS: a bigger jolt layered on top for individual kick hits.
+# --- Shake ---
+# BASS_SHAKE_PIXELS: small constant jitter while bass is present, so a
+# rolling bassline feels alive, not just individual hits.
+# KICK_SHAKE_PIXELS: a bigger jolt layered on top for individual kicks.
 BASS_SHAKE_PIXELS = 6
 KICK_SHAKE_PIXELS = 32
 
 # --- Full-screen glow/swell look ---
-GLOW_COLOR = "#7fdfff"         # tint color; change to taste, e.g. "#ff3366"
+GLOW_COLOR = "#7fdfff"     # tint color; change to taste, e.g. "#ff3366"
 
 # Radial vignette: color washes in from the screen edges toward the
 # center as bass builds. Higher VIGNETTE_POWER keeps the center clearer
-# for longer (color stays concentrated near the edges); lower values let
-# it fill the whole screen sooner.
+# for longer; lower values let color fill the whole screen sooner.
 VIGNETTE_POWER = 1.6
-VIGNETTE_MAX_ALPHA = 175       # 0-255, how opaque the glow gets at max bass
-VIGNETTE_LEVELS = 24           # precomputed intensity steps (smoothness vs. startup time/RAM)
+VIGNETTE_MAX_ALPHA = 175   # 0-255, how opaque the glow gets at max bass
 
-# Full-screen flash: a brief, near-uniform color wash across the ENTIRE
-# screen on kick hits, layered on top of the vignette - this is what
-# sells the "whole monitor swelling" feeling rather than just edges.
+# Full-screen flash: a brief, uniform color wash across the ENTIRE screen
+# on kick hits, layered on top of the vignette - this is what sells the
+# "whole monitor swelling" feeling rather than just edges.
 FLASH_MAX_ALPHA = 130
-FLASH_LEVELS = 16
 
 # Audio capture
 CHUNK = 1024
-AUDIO_FORMAT_BITS = 16
 
 # Frames per second for the overlay redraw loop
 FPS = 60
 
 # ================================================================
+
+KICK_DECAY_FACTOR = math.exp(-(1.0 / FPS) / KICK_DECAY_SEC)
 
 
 class SharedState:
@@ -179,7 +172,7 @@ class SharedState:
     def __init__(self):
         self.bass_level = 0.0       # smoothed 0..1 swell amount (volume-scaled)
         self.kick_pulse = 0.0       # 0..1, decays after a kick, drives jolt
-        self.volume_level = 0.0     # smoothed 0..1 overall loudness, for debugging/tuning
+        self.volume_level = 0.0     # smoothed 0..1 overall loudness
         self.suppress = 1.0         # 1.0 = full effect, 0.0 = fully suppressed
         self.running = True
 
@@ -260,16 +253,12 @@ def audio_thread_func():
 
         bass_energy = float(np.mean(spectrum[bass_mask])) if bass_mask.any() else 0.0
 
-        # Normalize roughly against int16 range * chunk size
         norm = bass_energy / (32768.0 * CHUNK / 4.0)
         norm = min(1.0, norm * BASS_SENSITIVITY)
 
-        # Smooth the swell value so it doesn't flicker, then scale by
-        # actual playback volume so quiet audio barely moves the screen.
         smoothed_bass = smoothed_bass * 0.75 + norm * 0.25
         state.bass_level = smoothed_bass * volume_factor
 
-        # Kick / transient detection off the rolling average
         rolling_avg = rolling_avg * 0.98 + bass_energy * 0.02
         now = time.time()
         if (
@@ -324,8 +313,6 @@ def excluded_monitor_thread_func():
                 )
 
                 if priority_peak > PRIORITY_ACTIVE_THRESHOLD:
-                    # A trusted app (browser/Voicemod/Spotify) is active -
-                    # keep the effect on regardless of anything else playing.
                     target = 1.0
                 else:
                     peaks.sort(key=lambda x: x[1], reverse=True)
@@ -339,7 +326,6 @@ def excluded_monitor_thread_func():
         except Exception:
             target = 1.0
 
-        # Smooth transition so suppression doesn't feel like a hard cut
         for _ in range(6):
             current += (target - current) * 0.3
             state.suppress = max(0.0, min(1.0, current))
@@ -348,147 +334,107 @@ def excluded_monitor_thread_func():
 
 # ----------------------------- Overlay UI -----------------------------
 
-class Overlay:
+class Overlay(QWidget):
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.configure(bg="black")
+        super().__init__()
 
-        self.screen_w = self.root.winfo_screenwidth()
-        self.screen_h = self.root.winfo_screenheight()
-        self.base_x = 0
-        self.base_y = 0
-        self.root.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+        screen = QGuiApplication.primaryScreen()
+        geo = screen.virtualGeometry()  # spans all monitors on Windows
+        self.screen_w = geo.width()
+        self.screen_h = geo.height()
 
-        # Black becomes fully transparent (Windows-only trick)
-        self.root.attributes("-transparentcolor", "black")
-
-        self.canvas = tk.Canvas(
-            self.root, width=self.screen_w, height=self.screen_h,
-            bg="black", highlightthickness=0
+        flags = (
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool                       # keeps it off the taskbar / alt-tab
+            | Qt.NoDropShadowWindowHint
         )
-        self.canvas.pack(fill="both", expand=True)
+        if hasattr(Qt, "WindowDoesNotAcceptFocus"):
+            flags |= Qt.WindowDoesNotAcceptFocus
+        self.setWindowFlags(flags)
 
-        self.root.update_idletasks()
-        self._make_click_through()
+        self.setAttribute(Qt.WA_TranslucentBackground, True)   # real per-pixel alpha
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)  # click-through
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
 
-        print("Warming up visuals (precomputing glow frames)...")
-        self.vignette_frames = self._build_gradient_frames(
-            levels=VIGNETTE_LEVELS, max_alpha=VIGNETTE_MAX_ALPHA,
-            power=VIGNETTE_POWER, radial=True,
-        )
-        self.flash_frames = self._build_gradient_frames(
-            levels=FLASH_LEVELS, max_alpha=FLASH_MAX_ALPHA,
-            power=1.0, radial=False,
-        )
-        print("Ready.")
+        self.setGeometry(geo)
 
-        self.vignette_image_id = self.canvas.create_image(
-            0, 0, anchor="nw", image=self.vignette_frames[0]
-        )
-        self.flash_image_id = self.canvas.create_image(
-            0, 0, anchor="nw", image=self.flash_frames[0]
-        )
+        self.glow_color = QColor(GLOW_COLOR)
 
-    def _make_click_through(self):
-        hwnd = win32gui.FindWindow(None, self.root.title() or None)
-        if not hwnd:
-            # fallback: get hwnd via winfo_id
-            hwnd = self.root.winfo_id()
-        try:
-            styles = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-            styles |= win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
-            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, styles)
-        except Exception:
-            pass  # if this fails, overlay still works, just won't be click-through
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)  # triggers paintEvent
+        self.timer.start(int(1000 / FPS))
 
-    @staticmethod
-    def _hex_to_rgb(hex_color):
-        hex_color = hex_color.lstrip("#")
-        return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
 
-    def _build_gradient_frames(self, levels, max_alpha, power, radial):
-        """Precompute a list of full-screen RGBA PhotoImages, one per
-        intensity level (0 = invisible, `levels` = full max_alpha), so the
-        animation loop just swaps images instead of doing per-frame image
-        math. `radial=True` gives edge-to-center vignette; `radial=False`
-        gives a near-uniform full-screen wash (used for the kick flash)."""
-        w, h = self.screen_w, self.screen_h
-        color = self._hex_to_rgb(GLOW_COLOR)
-
-        if radial:
-            ys, xs = np.mgrid[0:h, 0:w]
-            cx, cy = w / 2.0, h / 2.0
-            dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
-            max_dist = math.sqrt(cx ** 2 + cy ** 2)
-            norm = np.clip(dist / max_dist, 0.0, 1.0)
-            weight = norm ** power
-        else:
-            weight = np.ones((h, w), dtype=np.float64)
-
-        frames = []
-        for level in range(levels + 1):
-            intensity = level / levels
-            alpha = (weight * intensity * max_alpha).astype(np.uint8)
-            rgba = np.zeros((h, w, 4), dtype=np.uint8)
-            rgba[..., 0] = color[0]
-            rgba[..., 1] = color[1]
-            rgba[..., 2] = color[2]
-            rgba[..., 3] = alpha
-            img = Image.fromarray(rgba, mode="RGBA")
-            frames.append(ImageTk.PhotoImage(img))
-        return frames
-
-    def frame(self):
         bass = max(0.0, min(1.0, state.bass_level * state.suppress))
-        state.kick_pulse *= 0.80  # decay each frame
+        state.kick_pulse *= KICK_DECAY_FACTOR
         kick = max(0.0, min(1.0, state.kick_pulse * state.suppress))
 
-        # --- swap in the right precomputed glow/flash frames ---
-        v_idx = int(round(bass * VIGNETTE_LEVELS))
-        v_idx = max(0, min(VIGNETTE_LEVELS, v_idx))
-        self.canvas.itemconfig(self.vignette_image_id, image=self.vignette_frames[v_idx])
-
-        f_idx = int(round(kick * FLASH_LEVELS))
-        f_idx = max(0, min(FLASH_LEVELS, f_idx))
-        self.canvas.itemconfig(self.flash_image_id, image=self.flash_frames[f_idx])
-
-        # --- shake: a subtle constant jitter while bass is present, plus
-        # a bigger jolt layered on top for individual kick hits ---
-        bass_offset = bass * BASS_SHAKE_PIXELS
-        kick_offset = kick * KICK_SHAKE_PIXELS
-        total_offset = bass_offset + kick_offset
-
+        # --- shake: constant jitter from bass + a bigger jolt from kicks ---
+        total_offset = bass * BASS_SHAKE_PIXELS + kick * KICK_SHAKE_PIXELS
         if total_offset > 0.5:
-            dx = int(random.uniform(-total_offset, total_offset))
-            dy = int(random.uniform(-total_offset, total_offset))
+            dx = random.uniform(-total_offset, total_offset)
+            dy = random.uniform(-total_offset, total_offset)
         else:
-            dx = dy = 0
+            dx = dy = 0.0
+        painter.translate(dx, dy)
 
-        self.root.geometry(f"{self.screen_w}x{self.screen_h}+{dx}+{dy}")
+        w, h = self.screen_w, self.screen_h
+        cx, cy = w / 2.0, h / 2.0
+        max_radius = math.hypot(cx, cy)
+        pad = int(max(abs(dx), abs(dy))) + 4
+        fill_rect = QRectF(-pad, -pad, w + 2 * pad, h + 2 * pad)
 
-        self.root.after(int(1000 / FPS), self.frame)
+        # --- radial vignette: color washes in from edges toward center ---
+        if bass > 0.01:
+            # As bass increases, the transparent inner stop moves toward
+            # the center, so the colored region grows to fill more of
+            # the screen.
+            inner_stop = max(0.0, min(0.999, 1.0 - (bass ** (1.0 / VIGNETTE_POWER))))
+            gradient = QRadialGradient(QPointF(cx, cy), max_radius)
 
-    def run(self):
-        self.frame()
-        self.root.mainloop()
+            transparent = QColor(self.glow_color)
+            transparent.setAlpha(0)
+            gradient.setColorAt(inner_stop, transparent)
+
+            edge_color = QColor(self.glow_color)
+            edge_color.setAlpha(int(VIGNETTE_MAX_ALPHA * bass))
+            gradient.setColorAt(1.0, edge_color)
+
+            painter.fillRect(fill_rect, gradient)
+
+        # --- full-screen flash punch on kicks ---
+        if kick > 0.01:
+            flash_color = QColor(self.glow_color)
+            flash_color.setAlpha(int(FLASH_MAX_ALPHA * kick))
+            painter.fillRect(fill_rect, flash_color)
+
+        painter.end()
 
 
 def main():
     print("BassShake starting...")
     print("Excluded processes:", ", ".join(sorted(EXCLUDED_PROCESSES)))
+    print("Priority processes:", ", ".join(sorted(PRIORITY_PROCESSES)))
 
     audio_t = threading.Thread(target=audio_thread_func, daemon=True)
     monitor_t = threading.Thread(target=excluded_monitor_thread_func, daemon=True)
     audio_t.start()
     monitor_t.start()
 
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+
+    overlay = Overlay()
+    overlay.show()
+
     if HAVE_KEYBOARD:
         def quit_all():
             state.running = False
-            time.sleep(0.1)
-            sys.exit(0)
+            app.quit()
         try:
             keyboard.add_hotkey("ctrl+alt+q", quit_all)
             print("Press Ctrl+Alt+Q to quit.")
@@ -496,11 +442,9 @@ def main():
             print("Global hotkey unavailable (may need admin rights). "
                   "Use Task Manager to close BassShake.exe to quit.")
 
-    overlay = Overlay()
-    try:
-        overlay.run()
-    finally:
-        state.running = False
+    exit_code = app.exec()
+    state.running = False
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
